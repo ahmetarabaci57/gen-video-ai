@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+import re
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException
@@ -13,6 +14,7 @@ from schemas import GenerateReelsRequest, GenerateReelsResponse
 from services.comfy_service import ComfyService, ComfyServiceError
 from services.llm_service import LLMService, LLMServiceError
 from services.video_service import VideoService, VideoServiceError
+from services.audio_service import AudioService 
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,16 +22,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger("reels")
 
+# 🚨 FastAPI Başlatma Alanı
 app = FastAPI(
     title="Local Instagram Reels Generator",
     version="1.0.0",
-    description="Turkish idea -> Ollama -> ComfyUI (GPU) -> MoviePy (CPU).",
+    description="Turkish Text -> CPU TTS -> Ollama -> ComfyUI (GPU) -> MoviePy (CPU).",
 )
 
 llm_service = LLMService()
 comfy_service = ComfyService()
 video_service = VideoService()
+audio_service = AudioService()  
 gpu_lock = asyncio.Lock()
+
 INDEX_HTML = (settings.output_dir.parent / "templates" / "index.html").read_text(encoding="utf-8")
 
 
@@ -48,7 +53,7 @@ async def generate_reels(payload: GenerateReelsRequest) -> GenerateReelsResponse
     if gpu_lock.locked():
         raise HTTPException(
             status_code=429,
-            detail="Another reel is using the GPU. Wait until it finishes to protect 4GB VRAM.",
+            detail="GPU şu an başka bir video üretiyor, lütfen bekleyin.",
         )
 
     job_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
@@ -56,18 +61,45 @@ async def generate_reels(payload: GenerateReelsRequest) -> GenerateReelsResponse
 
     async with gpu_lock:
         try:
-            logger.info("Step 1/3 Ollama translation | job=%s", job_id)
-            prompts = await llm_service.idea_to_image_prompts(payload.idea, payload.num_frames)
+            speech_text = payload.idea  # Default olarak her şeyi oku (eğer tırnak yoksa)
+            
+            # Çift tırnak (") veya tek tırnak (') içerisindeki metni bulur
+            quotes = re.findall(r'["\']([^"\']+)["\']', payload.idea)
+            
+            if quotes:
+                speech_text = quotes[0]  # Sadece ilk tırnak içindeki cümleyi seslendir
+                logger.info("Filtrelenmiş Karakter Repliği (Seslendirilecek): %s", speech_text)
+            else:
+                logger.info("Tırnak bulunamadı, tüm metin seslendiriliyor.")
 
-            logger.info("Step 2/3 ComfyUI generation | job=%s frames=%s", job_id, len(prompts))
-            frames = await comfy_service.generate_frames(prompts, job_dir / "frames")
+            logger.info("Adım 1/4: CPU üzerinde Sadece Repliğin Ses Üretimi | job=%s", job_id)
+            audio_path = job_dir / "speech.mp3"
+            # payload.idea yerine filtrelenmiş speech_text'i gönderiyoruz!
+            await asyncio.to_thread(audio_service.generate_turkish_audio, speech_text, audio_path)
 
-            logger.info("Step 3/3 MoviePy CPU render | job=%s", job_id)
+            logger.info("Adım 2/4: Ollama ile Prompt Çevirisi ve Temizliği | job=%s", job_id)
+            # Görsel üretimi için Ollama'ya metnin tamamını gönderiyoruz ki sahneyi anlayabilsin
+            prompts = await llm_service.idea_to_image_prompts(payload.idea, 1) 
+            if not prompts:
+                raise LLMServiceError("Ollama herhangi bir prompt üretemedi.")
+            
+            if isinstance(prompts, list):
+                raw_prompt = prompts[0] if len(prompts) > 0 else str(prompts)
+            else:
+                raw_prompt = str(prompts)
+                
+            clean_prompt = raw_prompt.replace("[", "").replace("]", "").replace("'", "").replace('"', "").strip()
+            anime_prompt = f"anime style illustration, masterpiece, 8k, talking avatar portrait, {clean_prompt}"
+
+            logger.info("Adım 3/4: ComfyUI ile Tek Kare Karakter Çizimi | job=%s", job_id)
+            frames = await comfy_service.generate_frames([anime_prompt], job_dir / "frames")
+
+            logger.info("Adım 4/4: MoviePy ile Ses ve Görüntü Birleştirme | job=%s", job_id)
             video_path = await asyncio.to_thread(
-                video_service.render_reel,
+                video_service.render_talking_reel,
                 frames,
-                job_dir / "reel.mp4",
-                payload.seconds_per_frame,
+                audio_path,
+                job_dir / "reel.mp4"
             )
         except LLMServiceError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -82,10 +114,10 @@ async def generate_reels(payload: GenerateReelsRequest) -> GenerateReelsResponse
     return GenerateReelsResponse(
         status="completed",
         idea=payload.idea,
-        english_prompts=prompts,
+        english_prompts=[anime_prompt],
         frames=[str(path) for path in frames],
         video_path=str(video_path),
-        message="Reel generated locally. GPU was used only for ComfyUI; video render ran on CPU.",
+        message="Ses üretildi ve tek kare görsel ile başarıyla birleştirildi!",
     )
 
 

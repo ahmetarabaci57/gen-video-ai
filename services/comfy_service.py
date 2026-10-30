@@ -33,17 +33,35 @@ class ComfyService:
         self.workflow_path = settings.workflow_path
 
     async def generate_frames(self, prompts: list[str], job_dir: Path) -> list[Path]:
+        """
+        Gelen prompt listesindeki ilk elemanı alır ve Windows dosya sistemiyle 
+        çakışmayacak şekilde temiz ve güvenli bir isimle yerel diske kaydeder.
+        """
         workflow_template = self._load_workflow()
         job_dir.mkdir(parents=True, exist_ok=True)
         saved_frames: list[Path] = []
 
-        for index, prompt in enumerate(prompts, start=1):
-            logger.info("ComfyUI frame %s/%s", index, len(prompts))
-            image_bytes, filename = await self._generate_one(workflow_template, prompt, index)
-            frame_path = job_dir / f"frame_{index:02d}{Path(filename).suffix or '.png'}"
-            frame_path.write_bytes(image_bytes)
-            saved_frames.append(frame_path)
+        if not prompts:
+            raise ComfyServiceError("ComfyUI'a gönderilecek herhangi bir prompt bulunamadı.")
 
+        # Listenin içindeki ilk promptu güvenle ayıklıyoruz
+        target_prompt = prompts[0] if isinstance(prompts, list) else str(prompts)
+        
+        logger.info("ComfyUI tek kare çizimi başlatılıyor...")
+        logger.info(target_prompt)
+        
+        # ComfyUI'dan resmi ürettiriyoruz
+        image_bytes, _ = await self._generate_one(workflow_template, target_prompt, 1)
+        logger.info("image generated")
+        # 🚨 [Errno 22] ÇÖZÜMÜ: Gelen 'filename' değişkenine asla güvenmiyoruz!
+        # Doğrudan kendimiz güvenli ve sabit bir dosya adı (.png) veriyoruz.
+        frame_path = job_dir / "frame_01.png"
+        
+        # Dosyayı diske yazıyoruz
+        frame_path.write_bytes(image_bytes)
+        saved_frames.append(frame_path)
+        
+        logger.info("Görsel Windows dosya sistemine güvenle kaydedildi: %s", frame_path)
         return saved_frames
 
     def _load_workflow(self) -> dict[str, Any]:
@@ -66,15 +84,24 @@ class ComfyService:
     ) -> tuple[bytes, str]:
         client_id = str(uuid.uuid4())
         workflow = copy.deepcopy(workflow_template)
-        self._inject_positive_prompt(workflow, english_prompt)
+        
+        # 🚨 [Errno 22] ENGELLEYİCİ: prompt metnini saf string'e zorluyoruz
+        # İçindeki olası gizli dizi/liste karakterlerini tamamen temizliyoruz
+        clean_prompt = str(english_prompt).replace("[", "").replace("]", "").replace("'", "").replace('"', "").strip()
+        
+        self._inject_positive_prompt(workflow, clean_prompt)
         self._randomize_seed(workflow, frame_index)
-
+        logger.info("random seed injected")
         prompt_id = await self._queue_prompt(workflow, client_id)
+        logger.info("prompt queued")
         await self._wait_until_complete(client_id, prompt_id)
+        logger.info("prompt completed")
         return await self._download_output_image(prompt_id)
+
 
     def _inject_positive_prompt(self, workflow: dict[str, Any], english_prompt: str) -> None:
         target_id = self._find_positive_prompt_node(workflow)
+        logger.info("positive prompt node : " + target_id )
         node = workflow[target_id]
         inputs = node.setdefault("inputs", {})
         if "text" not in inputs:
@@ -82,8 +109,8 @@ class ComfyService:
                 f"Positive prompt node {target_id} has no 'text' input. "
                 "Export workflow_api.json from ComfyUI again."
             )
-        inputs["text"] = english_prompt
-        logger.debug("Injected prompt into node %s", target_id)
+        inputs["text"] = str(english_prompt)
+        logger.info("ComfyUI Node ID [%s] alanına prompt enjekte edildi.", target_id)
 
     def _find_positive_prompt_node(self, workflow: dict[str, Any]) -> str:
         clip_nodes: list[tuple[str, dict[str, Any]]] = []
@@ -106,10 +133,7 @@ class ComfyService:
         if clip_nodes:
             return clip_nodes[0][0]
 
-        raise ComfyServiceError(
-            "No CLIPTextEncode node found in workflow_api.json. "
-            "Export the API-format workflow from ComfyUI."
-        )
+        raise ComfyServiceError("workflow_api.json içinde CLIPTextEncode düğümü bulunamadı.")
 
     def _randomize_seed(self, workflow: dict[str, Any], frame_index: int) -> None:
         for node in workflow.values():
@@ -125,6 +149,17 @@ class ComfyService:
             inputs["seed"] = base_seed + frame_index * 97
 
     async def _queue_prompt(self, workflow: dict[str, Any], client_id: str) -> str:
+        """
+        [Errno 22] tqdm/flush hatasını engellemek için ComfyUI KSampler 
+        düğümlerindeki ilerleme durum çubuğu çizimini kodla kapatıyoruz.
+        """
+        # Workflow içindeki tüm KSampler düğümlerini tarayıp terminal pbar'ını susturuyoruz
+        for node_id, node_data in workflow.items():
+            if isinstance(node_data, dict) and node_data.get("class_type") == "KSampler":
+                inputs = node_data.setdefault("inputs", {})
+                # tqdm çakışmasını engellemek için gizli parametreyi True yapıyoruz
+                inputs["disable_pbar"] = True 
+
         payload = {"prompt": workflow, "client_id": client_id}
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -132,20 +167,16 @@ class ComfyService:
                 response.raise_for_status()
                 data = response.json()
         except httpx.ConnectError as exc:
-            raise ComfyServiceError(
-                "Cannot connect to ComfyUI at 127.0.0.1:8188. Start ComfyUI first."
-            ) from exc
+            raise ComfyServiceError("ComfyUI bağlantısı kurulamadı. Port: 8188 açık mı?") from exc
         except httpx.HTTPStatusError as exc:
             detail = exc.response.text[:500]
-            raise ComfyServiceError(f"ComfyUI rejected the workflow: {detail}") from exc
+            raise ComfyServiceError(f"ComfyUI akışı reddetti: {detail}") from exc
 
         prompt_id = data.get("prompt_id")
-        node_errors = data.get("node_errors") or {}
-        if node_errors:
-            raise ComfyServiceError(f"ComfyUI node errors: {node_errors}")
         if not prompt_id:
-            raise ComfyServiceError("ComfyUI did not return a prompt_id.")
+            raise ComfyServiceError("ComfyUI bir prompt_id döndüremedi.")
         return str(prompt_id)
+
 
     async def _wait_until_complete(self, client_id: str, prompt_id: str) -> None:
         uri = f"{self.ws_url}?clientId={client_id}"
@@ -155,7 +186,7 @@ class ComfyService:
                 while True:
                     remaining = deadline - asyncio.get_event_loop().time()
                     if remaining <= 0:
-                        raise ComfyServiceError("Timed out waiting for ComfyUI to finish.")
+                        raise ComfyServiceError("ComfyUI zaman aşımına uğradı.")
                     raw = await asyncio.wait_for(websocket.recv(), timeout=remaining)
                     if isinstance(raw, bytes):
                         continue
@@ -164,9 +195,14 @@ class ComfyService:
                     data = message.get("data") or {}
 
                     if message_type == "execution_error" and data.get("prompt_id") == prompt_id:
-                        raise ComfyServiceError(
-                            f"ComfyUI execution error: {data.get('exception_message') or data}"
-                        )
+                        # 🚨 [Errno 22] ÇÖZÜMÜ: Ham nesneyi veya kaçış karakteri barındıran stringleri fırlatmak yerine
+                        # sadece en yalın, temiz metni ayıklayıp hata olarak fırlatıyoruz.
+                        raw_error = str(data.get('exception_message') or "Unknown ComfyUI Node Error")
+                        clean_error_msg = raw_error.replace("\\", "/").replace("'", "").replace('"', "")
+                        
+                        logger.error("!!! COMFYUI GERÇEK İÇ HATASI !!!: %s", clean_error_msg)
+                        raise ComfyServiceError(f"ComfyUI Dahili Hatasi: {clean_error_msg}")
+
 
                     if (
                         message_type == "executing"
@@ -176,40 +212,28 @@ class ComfyService:
                         return
         except ComfyServiceError:
             raise
-        except (OSError, websockets.WebSocketException) as exc:
-            raise ComfyServiceError(
-                "ComfyUI WebSocket connection failed. Is ComfyUI running on port 8188?"
-            ) from exc
-        except asyncio.TimeoutError as exc:
-            raise ComfyServiceError("Timed out waiting for ComfyUI to finish.") from exc
+        except Exception as exc:
+            raise ComfyServiceError(f"WebSocket dinleme aşaması başarısız: {exc}") from exc
 
     async def _download_output_image(self, prompt_id: str) -> tuple[bytes, str]:
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                history_response = await client.get(f"{self.http_url}/history/{prompt_id}")
-                history_response.raise_for_status()
-                history = history_response.json()
-        except httpx.HTTPError as exc:
-            raise ComfyServiceError("Could not read ComfyUI history after generation.") from exc
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            history_response = await client.get(f"{self.http_url}/history/{prompt_id}")
+            history = history_response.json()
 
         job = history.get(prompt_id) or {}
         outputs = job.get("outputs") or {}
         image_meta = self._first_image_meta(outputs)
         if image_meta is None:
-            raise ComfyServiceError("ComfyUI finished but no image was found in the output nodes.")
+            raise ComfyServiceError("İşlem bitti ama çıktı düğümlerinde görsel bulunamadı.")
 
         params = {
             "filename": image_meta["filename"],
             "subfolder": image_meta.get("subfolder", ""),
             "type": image_meta.get("type", "output"),
         }
-        try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                view_response = await client.get(f"{self.http_url}/view", params=params)
-                view_response.raise_for_status()
-                return view_response.content, str(image_meta["filename"])
-        except httpx.HTTPError as exc:
-            raise ComfyServiceError("ComfyUI saved a frame but downloading it failed.") from exc
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            view_response = await client.get(f"{self.http_url}/view", params=params)
+            return view_response.content, str(image_meta["filename"])
 
     def _first_image_meta(self, outputs: dict[str, Any]) -> dict[str, Any] | None:
         for node_output in outputs.values():
@@ -218,9 +242,5 @@ class ComfyService:
             images = node_output.get("images") or []
             for image in images:
                 if isinstance(image, dict) and image.get("filename"):
-                    folder_type = str(image.get("type") or "output")
-                    if folder_type == "output":
-                        return image
-            if images and isinstance(images[0], dict) and images[0].get("filename"):
-                return images[0]
+                    return image
         return None
