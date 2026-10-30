@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Local Reels Generator</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0; font-family: Segoe UI, sans-serif; background: #0f1115; color: #e8eaed;
+      display: flex; justify-content: center; padding: 40px 16px;
+    }
+    main { width: min(720px, 100%); }
+    h1 { font-size: 1.6rem; margin: 0 0 8px; }
+    p { color: #9aa0a6; }
+    label { display: block; margin: 16px 0 6px; font-weight: 600; }
+    textarea, input {
+      width: 100%; box-sizing: border-box; background: #1a1d24; color: #e8eaed;
+      border: 1px solid #2c313c; border-radius: 8px; padding: 10px 12px;
+    }
+    textarea { min-height: 110px; resize: vertical; }
+    button {
+      margin-top: 18px; background: #3b82f6; color: white; border: 0; border-radius: 8px;
+      padding: 12px 18px; font-weight: 700; cursor: pointer;
+    }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    #status { margin-top: 18px; white-space: pre-wrap; color: #cbd5e1; }
+    #status.error { color: #f87171; }
+    a { color: #93c5fd; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Local Instagram Reels Generator</h1>
+    <p>Turkish idea → Ollama → ComfyUI → MoviePy. GPU lock keeps 4GB VRAM safe.</p>
+    <form id="form">
+      <label for="idea">Turkish idea</label>
+      <textarea id="idea" required placeholder="İstanbul'da yağmurlu bir gecede yürüyen bir kadın"></textarea>
+      <label for="num_frames">Frames</label>
+      <input id="num_frames" type="number" min="1" max="12" value="5" />
+      <label for="seconds_per_frame">Seconds per frame</label>
+      <input id="seconds_per_frame" type="number" min="0.8" max="8" step="0.1" value="2.2" />
+      <button type="submit" id="submit">Generate reel</button>
+    </form>
+    <div id="status"></div>
+  </main>
+  <script>
+    const form = document.getElementById("form");
+    const statusEl = document.getElementById("status");
+    const submit = document.getElementById("submit");
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      statusEl.className = "";
+      statusEl.textContent = "Generating... this can take several minutes. Keep Ollama and ComfyUI running.";
+      submit.disabled = true;
+      try {
+        const response = await fetch("/api/generate-reels", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            idea: document.getElementById("idea").value,
+            num_frames: Number(document.getElementById("num_frames").value),
+            seconds_per_frame: Number(document.getElementById("seconds_per_frame").value),
+          }),
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.detail || JSON.stringify(data));
+        }
+        const jobId = data.video_path.split(/[/\\]/).slice(-2, -1)[0];
+        statusEl.innerHTML =
+          "Done.\\n" +
+          "Video: " + data.video_path +
+          (jobId ? '<br><a href="/api/download/' + jobId + '">Download MP4</a>' : "");
+      } catch (error) {
+        statusEl.className = "error";
+        statusEl.textContent = String(error.message || error);
+      } finally {
+        submit.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
